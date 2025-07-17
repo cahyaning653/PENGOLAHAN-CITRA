@@ -1,0 +1,187 @@
+import cv2  
+import numpy as np  
+import os  
+
+# --- Fungsi Ekstraksi Fitur ---
+def extract_features(image_path):   
+    """
+    Ekstrak fitur histogram HSV dan fitur ORB dari gambar.
+    Mengembalikan tuple: (histogram_flattened, descriptors_orb)
+    """
+    image = cv2.imread(image_path)  # Baca gambar dari path
+    if image is None:
+        print(f"ERROR: Gambar {image_path} tidak ditemukan atau tidak bisa dibaca.")
+        return None, None
+
+    # Jika gambar grayscale, ubah ke BGR
+    if len(image.shape) == 2:
+        image_color = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    else:
+        image_color = image
+
+    image_resized = cv2.resize(image_color, (200, 200))  # Resize gambar untuk standarisasi ukuran
+
+    # 1. Ekstraksi Histogram HSV
+    hsv = cv2.cvtColor(image_resized, cv2.COLOR_BGR2HSV)  # Konversi ke HSV
+    hist = cv2.calcHist([hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])  # Hitung histogram HSV
+    cv2.normalize(hist, hist)  # Normalisasi histogram
+    hist_flat = hist.flatten()  # Ratakan histogram menjadi 1D array
+
+    # 2. Ekstraksi Fitur ORB
+    orb = cv2.ORB_create()  # Inisialisasi ORB
+    keypoints, descriptors = orb.detectAndCompute(image_resized, None)  # Ekstrak fitur ORB
+
+    if descriptors is None or descriptors.shape[0] == 0:
+        return hist_flat, np.array([], dtype=np.float32).reshape(0, 32)  # Jika tidak ada deskriptor, kembalikan array kosong
+    else:
+        return hist_flat, np.float32(descriptors)  # Kembalikan histogram dan deskriptor ORB
+
+
+# --- Fungsi Perbandingan Fitur ---
+def compare_features(feature1_hist, feature1_orb, feature2_hist, feature2_orb):
+    """
+    Hitung jarak gabungan dari histogram Euclidean dan kecocokan fitur ORB.
+    Jarak yang lebih kecil = lebih mirip.
+    """
+    distance_hist = np.linalg.norm(feature1_hist - feature2_hist)  # Jarak Euclidean antar histogram HSV
+
+    distance_orb = float('inf')  # Default jarak ORB jika tidak ada deskriptor
+
+    if feature1_orb.shape[0] > 0 and feature2_orb.shape[0] > 0:
+        FLANN_INDEX_LSH = 6
+        index_params = dict(algorithm=FLANN_INDEX_LSH, table_number=6, key_size=12, multi_probe_level=1)
+        search_params = dict(checks=50)
+        flann = cv2.FlannBasedMatcher(index_params, search_params)  # Inisialisasi FLANN Matcher untuk ORB
+
+        try:
+            matches = flann.knnMatch(feature1_orb, feature2_orb, k=2)  # Mencocokkan ORB dengan metode k-NN (k=2)
+
+            good_matches = []
+            for m, n in matches:
+                if m.distance < 0.75 * n.distance:  # Rasio jarak untuk menentukan good match
+                    good_matches.append(m)
+
+            distance_orb = 1.0 / (len(good_matches) + 1.0)  # Semakin banyak good match, jarak semakin kecil
+        except cv2.error as e:
+            print(f"WARNING: OpenCV error during knnMatch, likely too few features: {e}")
+            distance_orb = 5.0  # Jika error, berikan jarak tinggi
+    else:
+        distance_orb = 10.0  # Jika tidak ada fitur ORB sama sekali
+
+    combined_distance = (0.4 * distance_hist) + (0.6 * distance_orb)  # Gabungan jarak dengan bobot
+    return combined_distance
+
+
+# --- Fungsi Pencarian Gambar Mirip ---
+def cari_gambar_mirip(query_path, folder_database, top_k=1):  # top_k=1 artinya hanya cari 1 gambar paling mirip
+    """
+    Cari gambar paling mirip dari folder_database berdasarkan gambar query
+    menggunakan kombinasi histogram HSV dan fitur ORB.
+    """
+    print(f"Mengekstrak fitur dari gambar query: {query_path}")
+    query_hist, query_orb = extract_features(query_path)  # Ekstrak fitur query
+
+    if query_hist is None or query_orb is None:
+        print("Tidak dapat melanjutkan karena fitur gambar query tidak bisa diekstrak dengan lengkap.")
+        return []
+
+    results = []
+    print(f"Mencari di folder database: {folder_database}")
+    if not os.path.isdir(folder_database):
+        print(f"ERROR: Folder database '{folder_database}' tidak ditemukan.")
+        return []
+
+    for filename in os.listdir(folder_database):  # Iterasi semua file di database
+        file_path = os.path.join(folder_database, filename)
+        if not (filename.lower().endswith(('.jpg', '.jpeg', '.png'))):
+            continue  # Lewati jika bukan file gambar
+        if os.path.isdir(file_path):
+            continue  # Lewati jika path adalah folder
+
+        db_hist, db_orb = extract_features(file_path)  # Ekstrak fitur database
+        if db_hist is None or db_orb is None:
+            continue
+
+        distance = compare_features(query_hist, query_orb, db_hist, db_orb)  # Hitung jarak
+        results.append((filename, distance))
+
+    results = sorted(results, key=lambda x: x[1])  # Urutkan berdasarkan jarak terkecil
+    return results[:top_k]  # Kembalikan top_k hasil teratas
+
+
+# --- Fungsi Utama ---
+def main():
+    folder_database = "archive"  # Nama folder database gambar
+
+    query_path = input("Masukkan path file gambar query (misal: my_image.jpg atau C:/path/to/my_image.png): ")
+
+    # Validasi input path
+    if not os.path.exists(query_path):
+        print(f"ERROR: File query '{query_path}' tidak ditemukan. Pastikan path dan nama file benar.")
+        return
+    if not os.path.isfile(query_path):
+        print(f"ERROR: Path yang dimasukkan '{query_path}' bukan sebuah file. Harap masukkan path file gambar.")
+        return
+    if not query_path.lower().endswith(('.jpg', '.jpeg', '.png')):
+        print(f"ERROR: File query '{query_path}' bukan format gambar yang didukung (JPG/PNG).")
+        return
+
+    if not os.path.isdir(folder_database):
+        print(f"ERROR: Folder database '{folder_database}' tidak ditemukan. Harap buat folder ini dan isi dengan gambar secara langsung (tanpa sub-folder).")
+        return
+
+    print("\nMulai mencari gambar mirip...")
+    hasil = cari_gambar_mirip(query_path, folder_database, top_k=1)  # Cari gambar paling mirip
+
+    if not hasil:
+        print("Tidak ditemukan gambar mirip atau ada masalah dalam proses pencarian.")
+        return
+
+    print("\n--- Gambar Paling Mirip Ditemukan ---")
+    fname, dist = hasil[0]
+    print(f"1. {fname} (jarak: {dist:.4f})")
+
+    print("\nMenampilkan gambar query dan hasil paling mirip dalam satu jendela. Tekan tombol apapun untuk keluar.")
+
+    display_width = 250
+    display_height = 250
+
+    query_img = cv2.imread(query_path)  # Baca gambar query
+    if query_img is None:
+        print(f"ERROR: Gagal memuat gambar query untuk ditampilkan: {query_path}")
+        return
+
+    if len(query_img.shape) == 2:
+        query_img = cv2.cvtColor(query_img, cv2.COLOR_GRAY2BGR)
+
+    query_img_display = cv2.resize(query_img, (display_width, display_height))
+    cv2.putText(query_img_display, "GAMBAR QUERY", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+    images_to_display = [query_img_display]
+
+    fname_best, dist_best = hasil[0]
+    img_path_best = os.path.join(folder_database, fname_best)
+    img_best = cv2.imread(img_path_best)
+
+    if img_best is None:
+        print(f"ERROR: Gagal memuat gambar hasil terbaik: {img_path_best}")
+        img_display_best = np.zeros((display_height, display_width, 3), dtype=np.uint8)
+        cv2.putText(img_display_best, "GAGAL", (10, display_height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    else:
+        if len(img_best.shape) == 2:
+            img_best = cv2.cvtColor(img_best, cv2.COLOR_GRAY2BGR)
+        img_display_best = cv2.resize(img_best, (display_width, display_height))
+        cv2.putText(img_display_best, f"HASIL TERBAIK", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.putText(img_display_best, f"Jarak: {dist_best:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    images_to_display.append(img_display_best)
+
+    combined_image = np.hstack(images_to_display)  # Gabungkan dua gambar secara horizontal
+
+    cv2.imshow("Gambar Query dan Hasil Kemiripan Terbaik", combined_image)  # Tampilkan hasil
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()  # Jalankan program utama jika file ini di-run langsung
